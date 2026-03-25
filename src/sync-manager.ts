@@ -407,7 +407,14 @@ export default class SyncManager {
     } catch (err) {
       // Show the error to the user, it's not automatically dismissed to make sure
       // the user sees it.
-      new Notice(`Error syncing. ${err}`);
+      const msg =
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : JSON.stringify(err) ?? "Unknown error";
+      new Notice(`Error syncing. ${msg}`);
+      await this.logger.error("Sync error", err);
     }
     this.syncing = false;
     notice.hide();
@@ -520,58 +527,147 @@ export default class SyncManager {
         {},
       );
 
+    const failedActions: SyncAction[] = [];
+
     await Promise.all(
       actions.map(async (action) => {
-        switch (action.type) {
-          case "upload": {
-            const normalizedPath = normalizePath(action.filePath);
-            const resolution = conflictResolutions.find(
-              (c: ConflictResolution) => c.filePath === action.filePath,
-            );
-            // If the file was conflicting we need to read the content from the
-            // conflict resolution instead of reading it from file since at this point
-            // we still have not updated the local file.
-            const content =
-              resolution?.content ||
-              (await this.vault.adapter.read(normalizedPath));
-            newTreeFiles[action.filePath] = {
-              path: action.filePath,
-              mode: "100644",
-              type: "blob",
-              content: content,
-            };
-            break;
+        try {
+          switch (action.type) {
+            case "upload": {
+              const normalizedPath = normalizePath(action.filePath);
+              const resolution = conflictResolutions.find(
+                (c: ConflictResolution) => c.filePath === action.filePath,
+              );
+              // If the file was conflicting we need to read the content from the
+              // conflict resolution instead of reading it from file since at this point
+              // we still have not updated the local file.
+              const content =
+                resolution?.content ||
+                (await this.vault.adapter.read(normalizedPath));
+              newTreeFiles[action.filePath] = {
+                path: action.filePath,
+                mode: "100644",
+                type: "blob",
+                content: content,
+              };
+              break;
+            }
+            case "delete_remote": {
+              if (newTreeFiles[action.filePath]) {
+                newTreeFiles[action.filePath].sha = null;
+              } else {
+                // File already gone from remote tree — treat as success
+                await this.logger.info(
+                  "File already deleted on remote, skipping",
+                  action.filePath,
+                );
+              }
+              // Update local metadata to reflect the deletion so the same
+              // action is not regenerated on next sync
+              if (this.metadataStore.data.files[action.filePath]) {
+                this.metadataStore.data.files[action.filePath].deleted = true;
+                this.metadataStore.data.files[action.filePath].deletedAt =
+                  Date.now();
+              }
+              break;
+            }
+            case "download":
+              break;
+            case "delete_local":
+              break;
           }
-          case "delete_remote": {
-            newTreeFiles[action.filePath].sha = null;
-            break;
-          }
-          case "download":
-            break;
-          case "delete_local":
-            break;
+        } catch (err) {
+          await this.logger.error(
+            `Action failed: ${action.type} ${action.filePath}`,
+            err,
+          );
+          failedActions.push(action);
         }
       }),
     );
 
     // Download files and delete local files
+    const failedSet = new Set(failedActions);
     await Promise.all([
       ...actions
         .filter((action) => action.type === "download")
+        .filter((action) => !failedSet.has(action))
         .map(async (action: SyncAction) => {
-          await this.downloadFile(
-            files[action.filePath],
-            remoteMetadata.files[action.filePath].lastModified,
-          );
+          try {
+            await this.downloadFile(
+              files[action.filePath],
+              remoteMetadata.files[action.filePath].lastModified,
+            );
+          } catch (err) {
+            await this.logger.error(
+              `Action failed: ${action.type} ${action.filePath}`,
+              err,
+            );
+            failedActions.push(action);
+          }
         }),
       ...actions
         .filter((action) => action.type === "delete_local")
+        .filter((action) => !failedSet.has(action))
         .map(async (action: SyncAction) => {
-          await this.deleteLocalFile(action.filePath);
+          try {
+            await this.deleteLocalFile(action.filePath);
+          } catch (err) {
+            await this.logger.error(
+              `Action failed: ${action.type} ${action.filePath}`,
+              err,
+            );
+            failedActions.push(action);
+          }
         }),
     ]);
 
+    // Remove failed upload/delete_remote actions from the tree so we
+    // don't commit partial or broken changes for those files.
+    for (const failed of failedActions) {
+      if (
+        failed.type === "upload" ||
+        failed.type === "delete_remote"
+      ) {
+        // Restore the original tree entry so the commit doesn't include
+        // the failed action's changes.
+        if (files[failed.filePath]) {
+          newTreeFiles[failed.filePath] = {
+            path: files[failed.filePath].path,
+            mode: files[failed.filePath].mode,
+            type: files[failed.filePath].type,
+            sha: files[failed.filePath].sha,
+          };
+        } else {
+          delete newTreeFiles[failed.filePath];
+        }
+      }
+    }
+
+    // Only proceed with commit if there are successful actions to commit
+    const allFailedSet = new Set(failedActions);
+    const successfulActions = actions.filter(
+      (a) => !allFailedSet.has(a),
+    );
+    if (successfulActions.length === 0) {
+      if (failedActions.length > 0) {
+        throw new Error(
+          `All ${failedActions.length} sync action(s) failed. Check logs for details.`,
+        );
+      }
+      return;
+    }
+
     await this.commitSync(newTreeFiles, treeSha, conflictResolutions);
+    // Save metadata after successful commit to reflect completed actions
+    this.metadataStore.save();
+
+    if (failedActions.length > 0) {
+      await this.logger.warn("Sync completed with failures", failedActions);
+      new Notice(
+        `Sync completed with ${failedActions.length} failed action(s). Check console for details.`,
+      );
+    }
   }
 
   /**
@@ -665,8 +761,18 @@ export default class SyncManager {
   ) {
     let actions: SyncAction[] = [];
 
+    // Build a map from NFC-normalized local paths to original paths
+    // to handle Unicode normalization differences (e.g. ø vs ø)
+    const normalizedLocalPaths: { [key: string]: string } = {};
+    for (const filePath of Object.keys(localFiles)) {
+      normalizedLocalPaths[filePath.normalize("NFC")] = filePath;
+    }
+
     const commonFiles = Object.keys(remoteFiles)
-      .filter((filePath) => filePath in localFiles)
+      .filter((filePath) => {
+        const nfc = filePath.normalize("NFC");
+        return nfc in normalizedLocalPaths;
+      })
       // Remove conflicting files, we determine their actions in a different way
       .filter((filePath) => !conflictFiles.contains(filePath));
 
@@ -679,7 +785,15 @@ export default class SyncManager {
         }
 
         const remoteFile = remoteFiles[filePath];
-        const localFile = localFiles[filePath];
+        const nfcPath = filePath.normalize("NFC");
+        const localFilePath = normalizedLocalPaths[nfcPath] ?? filePath;
+        if (localFilePath !== filePath) {
+          await this.logger.warn(
+            "Unicode normalization mismatch between remote and local path",
+            { remotePath: filePath, localPath: localFilePath },
+          );
+        }
+        const localFile = localFiles[localFilePath];
         if (remoteFile.deleted && localFile.deleted) {
           // Nothing to do
           return;
@@ -739,7 +853,9 @@ export default class SyncManager {
     // Get diff for files in remote but not in local
     Object.keys(remoteFiles).forEach((filePath: string) => {
       const remoteFile = remoteFiles[filePath];
-      const localFile = localFiles[filePath];
+      const nfc = filePath.normalize("NFC");
+      const localFilePath = normalizedLocalPaths[nfc];
+      const localFile = localFilePath ? localFiles[localFilePath] : undefined;
       if (localFile) {
         // Local file exists, we already handled it.
         // Skip it.
@@ -754,9 +870,19 @@ export default class SyncManager {
       }
     });
 
+    // Build a map from NFC-normalized remote paths to original paths
+    const normalizedRemotePaths: { [key: string]: string } = {};
+    for (const filePath of Object.keys(remoteFiles)) {
+      normalizedRemotePaths[filePath.normalize("NFC")] = filePath;
+    }
+
     // Get diff for files in local but not in remote
     Object.keys(localFiles).forEach((filePath: string) => {
-      const remoteFile = remoteFiles[filePath];
+      const nfc = filePath.normalize("NFC");
+      const remoteFilePath = normalizedRemotePaths[nfc];
+      const remoteFile = remoteFilePath
+        ? remoteFiles[remoteFilePath]
+        : undefined;
       const localFile = localFiles[filePath];
       if (remoteFile) {
         // Remote file exists, we already handled it.
