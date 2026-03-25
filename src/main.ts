@@ -162,7 +162,13 @@ export default class GitHubSyncPlugin extends Plugin {
       } catch (err) {
         // Show the error to the user, it's not automatically dismissed to make sure
         // the user sees it.
-        new Notice(`Error syncing. ${err}`);
+        const msg =
+          err instanceof Error
+            ? err.message
+            : typeof err === "string"
+              ? err
+              : JSON.stringify(err) ?? "Unknown error";
+        new Notice(`Error syncing. ${msg}`);
       }
       notice.hide();
     } else {
