@@ -587,10 +587,11 @@ export default class SyncManager {
     );
 
     // Download files and delete local files
+    const failedSet = new Set(failedActions);
     await Promise.all([
       ...actions
         .filter((action) => action.type === "download")
-        .filter((action) => !failedActions.includes(action))
+        .filter((action) => !failedSet.has(action))
         .map(async (action: SyncAction) => {
           try {
             await this.downloadFile(
@@ -607,7 +608,7 @@ export default class SyncManager {
         }),
       ...actions
         .filter((action) => action.type === "delete_local")
-        .filter((action) => !failedActions.includes(action))
+        .filter((action) => !failedSet.has(action))
         .map(async (action: SyncAction) => {
           try {
             await this.deleteLocalFile(action.filePath);
@@ -644,8 +645,9 @@ export default class SyncManager {
     }
 
     // Only proceed with commit if there are successful actions to commit
+    const allFailedSet = new Set(failedActions);
     const successfulActions = actions.filter(
-      (a) => !failedActions.includes(a),
+      (a) => !allFailedSet.has(a),
     );
     if (successfulActions.length === 0) {
       if (failedActions.length > 0) {
@@ -783,8 +785,14 @@ export default class SyncManager {
         }
 
         const remoteFile = remoteFiles[filePath];
-        const localFilePath =
-          normalizedLocalPaths[filePath.normalize("NFC")] ?? filePath;
+        const nfcPath = filePath.normalize("NFC");
+        const localFilePath = normalizedLocalPaths[nfcPath] ?? filePath;
+        if (localFilePath !== filePath) {
+          await this.logger.warn(
+            "Unicode normalization mismatch between remote and local path",
+            { remotePath: filePath, localPath: localFilePath },
+          );
+        }
         const localFile = localFiles[localFilePath];
         if (remoteFile.deleted && localFile.deleted) {
           // Nothing to do
